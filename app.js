@@ -8,7 +8,7 @@
       tenantId: "3643e7ab-d166-4e27-bd5f-c5bbfcd282d7",
       clientId: "c4143c1e-33ea-4c4d-a410-58110f966d0a",
       authority: "https://login.microsoftonline.com/3643e7ab-d166-4e27-bd5f-c5bbfcd282d7",
-      redirectUri: "https://markusbaechler.github.io/crm-spa/",
+      redirectUri: "https://markusbaechler.github.io/crm-spa-dev/",
       // FIX 3a: Scope auf ReadWrite erweitert — verhindert zweiten Login-Prompt beim Write-Layer
       scopes: ["User.Read", "Sites.ReadWrite.All"]
     },
@@ -810,11 +810,22 @@
       });
 
       // Initialen State setzen damit der erste Back-Schritt korrekt funktioniert
-      history.replaceState(
-        { route: state.filters.route, firmId: null, contactId: null },
-        "",
-        `#${state.filters.route}`
-      );
+      // WICHTIG: Nicht ausführen wenn MSAL gerade einen Auth-Redirect verarbeitet
+      // (Hash enthält "code=" oder "error=") — sonst überschreibt replaceState den Auth-Hash
+      // und handleRedirectPromise() findet keinen gültigen Hash mehr
+      // MSAL v3 PKCE: Auth-Code kommt als Query-Parameter (?code=) ODER im Hash
+      // Guard: replaceState nicht ausführen wenn MSAL gerade einen Redirect verarbeitet
+      const currentHash = window.location.hash;
+      const currentSearch = window.location.search;
+      const isMsalRedirect = currentHash.includes("code=") || currentHash.includes("error=") || currentHash.includes("state=")
+                          || currentSearch.includes("code=") || currentSearch.includes("error=") || currentSearch.includes("state=");
+      if (!isMsalRedirect) {
+        history.replaceState(
+          { route: state.filters.route, firmId: null, contactId: null },
+          "",
+          `#${state.filters.route}`
+        );
+      }
 
       document.addEventListener("input", (event) => {
         const el = event.target;
@@ -879,7 +890,17 @@
       });
 
       if (state.auth.isAuthenticated && state.auth.account) {
-        this.els.authStatus.innerHTML = `<span class="bbz-auth-dot"></span><span>Angemeldet: ${helpers.escapeHtml(state.auth.account.username || state.auth.account.name || "")}</span>`;
+        this.els.authStatus.innerHTML = (() => {
+          const acc = state.auth.account;
+          // MSAL v3: username = UPN/E-Mail, idTokenClaims.preferred_username als Fallback
+          const email = acc.username
+            || acc.idTokenClaims?.preferred_username
+            || acc.idTokenClaims?.email
+            || acc.idTokenClaims?.upn
+            || acc.name
+            || "";
+          return `<span class="bbz-auth-dot"></span><span>Angemeldet: ${helpers.escapeHtml(email)}</span>`;
+        })();
       } else if (state.auth.isReady) {
         this.els.authStatus.innerHTML = `<span class="bbz-auth-dot" style="background:#94a3b8;"></span><span>Nicht angemeldet</span>`;
       } else {
@@ -945,35 +966,48 @@
       state.auth.isReady = false;
       state.auth.msal = null;
 
+      // MSAL v3: PublicClientApplication mit PKCE — löst Hash-Problem auf Mobile
       const msalInstance = new window.msal.PublicClientApplication({
         auth: {
           clientId: CONFIG.graph.clientId,
           authority: CONFIG.graph.authority,
           redirectUri: CONFIG.graph.redirectUri
         },
-        cache: { cacheLocation: "localStorage" }
+        cache: {
+          cacheLocation: "localStorage",
+          storeAuthStateInCookie: true
+        },
+        system: {
+          allowNativeBroker: false
+        }
       });
 
+      // MSAL v3: initialize() verarbeitet Redirect-Response automatisch
       await msalInstance.initialize();
       state.auth.msal = msalInstance;
 
+      // MSAL v3: handleRedirectPromise() nach initialize() aufrufen
       try {
         const redirectResponse = await state.auth.msal.handleRedirectPromise();
         if (redirectResponse?.account) {
           state.auth.account = redirectResponse.account;
           state.auth.isAuthenticated = true;
+          // URL nach Redirect bereinigen
+          history.replaceState(
+            { route: CONFIG.defaults.route, firmId: null, contactId: null },
+            "",
+            `#${CONFIG.defaults.route}`
+          );
         }
       } catch (error) {
         console.warn("handleRedirectPromise Fehler:", error);
         state.meta.lastError = error;
-        // Nicht fatal — App kann trotzdem mit Cache-Account weitermachen
       }
 
-      // Accounts aus Cache nachladen falls kein Redirect-Response
+      // Account aus Cache laden
       if (!state.auth.account) {
         const accounts = state.auth.msal.getAllAccounts();
         if (accounts.length > 0) {
-          // Tenant-Match bevorzugen — verhindert falschen Account bei Multi-Tenant-Umgebungen
           state.auth.account = accounts.find(a => a.tenantId === CONFIG.graph.tenantId) || accounts[0];
           state.auth.isAuthenticated = true;
         }
@@ -982,16 +1016,36 @@
       state.auth.isReady = true;
     },
 
+    // Zentrale Interaktions-Funktion: versucht Popup, fällt bei popup_window_error
+    // automatisch auf Redirect zurück (Popups durch Browser/Policy geblockt).
+    // Gibt null zurück bei Redirect — Browser navigiert weg, kein Code läuft weiter.
+    async msalInteract(request) {
+      const isMobile = window.innerWidth < 768 || /Mobi|Android/i.test(navigator.userAgent);
+      if (isMobile) {
+        await state.auth.msal.loginRedirect(request);
+        return null;
+      }
+      try {
+        return await state.auth.msal.loginPopup(request);
+      } catch (popupErr) {
+        if (popupErr.errorCode === "popup_window_error" || (popupErr.message || "").includes("popup_window")) {
+          console.warn("Popup geblockt — Redirect-Fallback.");
+          await state.auth.msal.loginRedirect(request);
+          return null;
+        }
+        throw popupErr;
+      }
+    },
+
     async login() {
       if (!state.auth.msal) throw new Error("MSAL ist nicht initialisiert.");
-
-      const loginResponse = await state.auth.msal.loginPopup({
+      const loginResponse = await this.msalInteract({
         scopes: CONFIG.graph.scopes,
         prompt: "select_account"
       });
+      if (loginResponse === null) return; // Redirect — Browser navigiert weg
 
       if (!loginResponse?.account) throw new Error("Keine Kontoinformation aus dem Login erhalten.");
-
       state.auth.account = loginResponse.account;
       state.auth.isAuthenticated = true;
       await this.acquireToken();
@@ -1023,13 +1077,24 @@
         state.auth.token = tokenResponse.accessToken;
         return state.auth.token;
       } catch (silentError) {
-        console.warn("Silent token fehlgeschlagen, versuche Popup:", silentError);
-        const tokenResponse = await state.auth.msal.acquireTokenPopup({
+        console.warn("Silent token fehlgeschlagen:", silentError);
+        const isMobile = window.innerWidth < 768 || /Mobi|Android/i.test(navigator.userAgent);
+        if (isMobile) {
+          // Mobile: Token-Refresh via Redirect
+          await state.auth.msal.acquireTokenRedirect({
+            account: state.auth.account,
+            scopes: CONFIG.graph.scopes
+          });
+          return state.auth.token;
+        }
+        // Desktop: Token-Refresh via Popup (mit Redirect-Fallback bei geblockten Popups)
+        const interactResponse = await this.msalInteract({
           account: state.auth.account,
           scopes: CONFIG.graph.scopes
         });
-        if (!tokenResponse?.accessToken) throw new Error("Kein Token aus acquireTokenPopup erhalten.");
-        state.auth.token = tokenResponse.accessToken;
+        if (interactResponse === null) return state.auth.token; // Redirect — Browser navigiert weg
+        if (!interactResponse?.accessToken) throw new Error("Kein Token aus acquireTokenPopup erhalten.");
+        state.auth.token = interactResponse.accessToken;
         return state.auth.token;
       }
     },
@@ -1046,7 +1111,6 @@
       if (!response.ok) {
         let detail = "";
         try {
-          // Vollständigen Body lesen — gibt bei 400 den exakten SP-Feldnamen
           detail = await response.text();
           console.error(`Graph ${response.status} auf ${options.method || "GET"} ${path}:`, detail);
         } catch { detail = response.statusText; }
@@ -1055,6 +1119,63 @@
 
       if (response.status === 204) return null;
       return await response.json();
+    },
+
+    // Prüft ob Consent für Sites.ReadWrite.All bereits erteilt wurde.
+    // Macht einen einzelnen, sequenziellen Probe-Call auf /sites/{ref} —
+    // bevor Promise.all() 4 parallele Calls startet die alle gleichzeitig
+    // mit 403 scheitern und sich gegenseitig mit interaction_in_progress blockieren.
+    async ensureConsent() {
+      const siteRef = `${CONFIG.sharePoint.siteHostname}:${CONFIG.sharePoint.sitePath}`;
+      const token = await this.acquireToken();
+      const probe = await fetch(`https://graph.microsoft.com/v1.0/sites/${siteRef}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      if (probe.ok) {
+        // Consent vorhanden — SiteId gleich cachen
+        const data = await probe.json();
+        state.meta.siteId = data.id;
+        return;
+      }
+
+      let detail = "";
+      try { detail = await probe.text(); } catch { detail = probe.statusText; }
+
+      if (probe.status === 403 && detail.includes("accessDenied")) {
+        console.warn("Consent fehlt für Sites.ReadWrite.All — starte Consent-Flow.");
+        const isMobile = window.innerWidth < 768 || /Mobi|Android/i.test(navigator.userAgent);
+        if (isMobile) {
+          await state.auth.msal.loginRedirect({
+            account: state.auth.account,
+            scopes: CONFIG.graph.scopes,
+            prompt: "consent"
+          });
+          return; // Browser navigiert weg
+        } else {
+          const consentResponse = await this.msalInteract({
+            account: state.auth.account,
+            scopes: CONFIG.graph.scopes,
+            prompt: "consent"
+          });
+          if (consentResponse === null) return; // Redirect — Browser navigiert weg
+          if (consentResponse?.account) {
+            state.auth.account = consentResponse.account;
+            state.auth.token = consentResponse.accessToken;
+          }
+          // Zweiter Probe nach Consent — wenn immer noch 403: echter Berechtigungsfehler
+          const probe2 = await fetch(`https://graph.microsoft.com/v1.0/sites/${siteRef}`, {
+            headers: { Authorization: `Bearer ${state.auth.token}` }
+          });
+          if (!probe2.ok) throw new Error("Zugriff auf SharePoint auch nach Consent verweigert. Bitte Administrator kontaktieren.");
+          const data2 = await probe2.json();
+          state.meta.siteId = data2.id;
+          return;
+        }
+      }
+
+      // Anderer Fehler (kein Consent-Problem)
+      throw new Error(`Graph ${probe.status}: ${detail}`);
     },
 
     async getSiteId() {
@@ -1385,8 +1506,8 @@
               <div class="bbz-modal-title">${title}</div>
               <button type="button" class="bbz-button bbz-button-secondary" data-close-modal>Schliessen</button>
             </div>
-            <form data-modal-form="contact" data-mode="${mode}" data-item-id="${itemId || ""}">
-              <div class="bbz-modal-body">
+            <form data-modal-form="contact" data-mode="${mode}" data-item-id="${itemId || ""}" style="display:flex;flex-direction:column;flex:1;min-height:0;">
+              <div class="bbz-modal-body" style="flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;">
                 <div class="bbz-form-grid">
 
                   <div class="bbz-field">
@@ -1495,8 +1616,8 @@
               <div class="bbz-modal-title">${title}</div>
               <button type="button" class="bbz-button bbz-button-secondary" data-close-modal>Schliessen</button>
             </div>
-            <form data-modal-form="firm" data-mode="${mode}" data-item-id="${firmId || ""}">
-              <div class="bbz-modal-body">
+            <form data-modal-form="firm" data-mode="${mode}" data-item-id="${firmId || ""}" style="display:flex;flex-direction:column;flex:1;min-height:0;">
+              <div class="bbz-modal-body" style="flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;">
                 <div class="bbz-form-grid">
                   <div class="bbz-field bbz-span-2">
                     <label>Firmenname *</label>
@@ -1559,8 +1680,8 @@
               <div class="bbz-modal-title">${title}</div>
               <button type="button" class="bbz-button bbz-button-secondary" data-close-modal>Schliessen</button>
             </div>
-            <form data-modal-form="history" data-mode="${mode}" data-item-id="${itemId || ""}">
-              <div class="bbz-modal-body">
+            <form data-modal-form="history" data-mode="${mode}" data-item-id="${itemId || ""}" style="display:flex;flex-direction:column;flex:1;min-height:0;">
+              <div class="bbz-modal-body" style="flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;">
                 <div class="bbz-form-grid">
                   <div class="bbz-field">
                     <label>Kontakt *</label>
@@ -1623,8 +1744,8 @@
               <div class="bbz-modal-title">${title}</div>
               <button type="button" class="bbz-button bbz-button-secondary" data-close-modal>Schliessen</button>
             </div>
-            <form data-modal-form="task" data-mode="${mode}" data-item-id="${itemId || ""}">
-              <div class="bbz-modal-body">
+            <form data-modal-form="task" data-mode="${mode}" data-item-id="${itemId || ""}" style="display:flex;flex-direction:column;flex:1;min-height:0;">
+              <div class="bbz-modal-body" style="flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;">
                 <div class="bbz-form-grid">
                   <div class="bbz-field bbz-span-2">
                     <label>Titel *</label>
@@ -1724,8 +1845,8 @@
               <div class="bbz-modal-title">${isEventhistory ? "Eventhistory setzen" : `${helpers.escapeHtml(activeCategory)} — Event setzen`}</div>
               <button type="button" class="bbz-button bbz-button-secondary" data-close-modal>Schliessen</button>
             </div>
-            <form data-modal-form="batch-event" data-event-name="${helpers.escapeHtml(activeCategory)}" data-mode="${mode}">
-              <div class="bbz-modal-body">
+            <form data-modal-form="batch-event" data-event-name="${helpers.escapeHtml(activeCategory)}" data-mode="${mode}" style="display:flex;flex-direction:column;flex:1;min-height:0;">
+              <div class="bbz-modal-body" style="flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;">
 
                 ${isEventhistory ? `
                 <!-- Schritt 1: Kategorie wählen -->
@@ -2010,9 +2131,9 @@
                   <div class="bbz-section-title">${filters.radarMode ? "Pflege A/B" : "Firmen-Cockpit"}</div>
                   <div class="bbz-section-subtitle">${filters.radarMode ? `${radarRows.filter(f => helpers.firmSignal(f) !== "ok").length} mit Handlungsbedarf · ${onTrackCount} On Track ✓` : "Segment, Tasks und Fristen auf einen Blick"}</div>
                 </div>
-                <div style="display:flex;gap:8px;align-items:center;">
-                  <!-- Tab-Bar -->
-                  <div style="display:flex;border:1px solid var(--line);border-radius:9px;overflow:hidden;background:var(--panel-2);">
+                <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+                  <!-- Tab-Bar: nur Desktop -->
+                  <div class="bbz-desktop-only" style="display:flex;border:1px solid var(--line);border-radius:9px;overflow:hidden;background:var(--panel-2);">
                     <button class="bbz-button" style="height:32px;font-size:12px;border:none;border-radius:0;${!filters.radarMode ? "background:var(--panel);color:var(--text);font-weight:700;" : "background:none;color:var(--muted);"}"
                       data-action="kpi-filter" data-scope="firms-radar" ${!filters.radarMode ? "disabled" : ""}>
                       Alle Firmen
@@ -2032,16 +2153,11 @@
                     value="${helpers.escapeHtml(filters.search)}" />
                 </div>
                 ${filters.radarMode ? `
-                <div class="bbz-table-wrap">
+                <!-- Desktop: Tabelle -->
+                <div class="bbz-table-wrap bbz-desktop-only">
                   <table class="bbz-table">
                     <thead><tr>
-                      <th></th>
-                      <th>Firma</th>
-                      <th>Klassifizierung</th>
-                      <th>Pflege-Grund</th>
-                      <th>Letzte Aktivität</th>
-                      <th>Nächste Deadline</th>
-                      <th>Kontakte</th>
+                      <th></th><th>Firma</th><th>Klassifizierung</th><th>Pflege-Grund</th><th>Letzte Aktivität</th><th>Nächste Deadline</th><th>Kontakte</th>
                     </tr></thead>
                     <tbody>
                       ${radarRows.length ? radarRows.map(firm => {
@@ -2078,6 +2194,32 @@
                       }).join("") : `<tr><td colspan="7">${ui.emptyBlock("Keine Pflege-Fälle gefunden.")}</td></tr>`}
                     </tbody>
                   </table>
+                </div>
+                <!-- Mobile: Card-List Radar -->
+                <div class="bbz-mobile-only bbz-card-list">
+                  ${radarRows.length ? radarRows.map(firm => {
+                    const sig = helpers.firmSignal(firm);
+                    const sigClass = sig === "overdue" ? "bbz-signal-red" : sig === "ok" ? "bbz-signal-green" : "bbz-signal-amber";
+                    const lastDate = helpers.toDate(firm.latestActivity);
+                    const months = lastDate ? (today.getFullYear() - lastDate.getFullYear()) * 12 + (today.getMonth() - lastDate.getMonth()) : null;
+                    const grundText = sig === "never" ? "🔴 Nie kontaktiert"
+                      : sig === "cold" ? `🟡 Seit ${months} Monat${months !== 1 ? "en" : ""} still`
+                      : sig === "ok" ? `✅ On Track`
+                      : `⚠️ ${firm.tasks.filter(t => t.isOpen && t.isOverdue).length} Task(s) überfällig`;
+                    return `<div class="bbz-list-card" data-action="open-firm" data-id="${firm.id}">
+                      <span class="bbz-signal ${sigClass}"></span>
+                      <div class="bbz-list-card-body">
+                        <div class="bbz-list-card-title">${helpers.escapeHtml(firm.title)}</div>
+                        <div class="bbz-list-card-sub">
+                          ${firm.klassifizierung ? `<span class="${helpers.firmBadgeClass(firm.klassifizierung)}" style="margin-right:4px;">${helpers.escapeHtml(firm.klassifizierung)}</span>` : ""}
+                          ${grundText}
+                        </div>
+                      </div>
+                      <div class="bbz-list-card-right">
+                        ${firm.latestActivity ? `<span style="font-size:10px;color:var(--subtle);">${helpers.relativeDate(firm.latestActivity)}</span>` : ""}
+                      </div>
+                    </div>`;
+                  }).join("") : ui.emptyBlock("Keine Pflege-Fälle gefunden.")}
                 </div>` : `
                 <div class="bbz-table-wrap">
                   <table class="bbz-table">
@@ -2340,7 +2482,8 @@
                 <button class="bbz-button bbz-button-secondary" style="height:32px;font-size:13px;" data-action="open-task-form" data-firm-id="${firm.id}">+ Task</button>
               </div>
               <div class="bbz-section-body">
-                <div class="bbz-table-wrap">
+                <!-- Desktop: Tabelle -->
+                <div class="bbz-table-wrap bbz-desktop-only">
                   <table class="bbz-table">
                     <thead><tr><th>Titel</th><th>Deadline</th><th>Status</th><th>Kontakt</th><th>Aktionen</th></tr></thead>
                     <tbody>
@@ -2357,6 +2500,21 @@
                         </tr>`).join("") : `<tr><td colspan="5">${ui.emptyBlock("Keine Aufgaben vorhanden.")}</td></tr>`}
                     </tbody>
                   </table>
+                </div>
+                <!-- Mobile: Card-List -->
+                <div class="bbz-mobile-only">
+                  ${firm.tasks.length ? `<div class="bbz-card-list">${firm.tasks.map(t => `
+                    <div class="bbz-task-card" data-action="edit-task" data-id="${t.id}">
+                      <div class="bbz-task-card-top">
+                        <span class="bbz-task-card-title">${helpers.escapeHtml(t.title)}</span>
+                        ${helpers.statusChipHtml(t.status, t.deadline)}
+                      </div>
+                      <div class="bbz-task-card-meta">
+                        ${t.contactName ? `<span>${helpers.escapeHtml(t.contactName)}</span>` : ""}
+                        ${t.deadline ? `<span>·</span><span class="${t.isOpen && t.isOverdue ? "bbz-danger" : ""}">${helpers.relativeDate(t.deadline)}</span>` : ""}
+                      </div>
+                    </div>`).join("")}</div>`
+                  : ui.emptyBlock("Keine Aufgaben vorhanden.")}
                 </div>
               </div>
             </section>
@@ -2438,19 +2596,19 @@
           <section class="bbz-section">
           <div class="bbz-section-header">
             <div><div class="bbz-section-title">Kontakte</div><div class="bbz-section-subtitle">${kpiMode === "history" ? "Mit History-Einträgen" : kpiMode === "tasks" ? "Mit offenen Tasks" : "Operative Ansprechpartner über alle Firmen"}</div></div>
-            <div style="display:flex;align-items:center;gap:8px;">
-              <button class="bbz-dense-toggle" onclick="window.bbzToggleDense && window.bbzToggleDense()" title="Kompakte Ansicht">⇕ Kompakt</button>
+            <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+              <button class="bbz-dense-toggle bbz-desktop-only" onclick="window.bbzToggleDense && window.bbzToggleDense()" title="Kompakte Ansicht">⇕ Kompakt</button>
               <button class="bbz-button bbz-button-secondary" data-action="open-history-form">+ Aktivität</button>
               <button class="bbz-button bbz-button-primary" data-action="open-contact-form">+ Kontakt</button>
             </div>
           </div>
           <div class="bbz-section-body">
-            <div class="bbz-filters-3">
+            <div style="display:grid;grid-template-columns:1fr;gap:8px;margin-bottom:10px;">
               <input class="bbz-input" data-filter="contacts-search" type="text" placeholder="Suche nach Name, Firma, Funktion, Rolle, E-Mail ..." value="${helpers.escapeHtml(filters.search)}" />
               <label class="bbz-checkbox"><input type="checkbox" data-filter="contacts-archiviert" ${filters.archiviertAusblenden ? "checked" : ""} /> Archivierte ausblenden</label>
-              <div></div>
             </div>
-            <div class="bbz-table-wrap">
+            <!-- Desktop: Tabelle -->
+            <div class="bbz-table-wrap bbz-desktop-only">
               <table class="bbz-table">
                 <thead><tr>${cTh("Name","fullName")}${cTh("Firma","firmTitle")}<th>Funktion</th>${cTh("Rolle","rolle")}${cTh("Lead BBZ","leadbbz0")}<th>E-Mail</th><th>Telefon</th><th>Archiviert</th></tr></thead>
                 <tbody>
@@ -2467,6 +2625,26 @@
                     </tr>`).join("") : `<tr><td colspan="8">${ui.emptyBlock("Keine Kontakte fuer die aktuelle Filterung gefunden.")}</td></tr>`}
                 </tbody>
               </table>
+            </div>
+            <!-- Mobile: Card-List -->
+            <div class="bbz-mobile-only bbz-card-list">
+              ${rows.length ? rows.map(c => `
+                <div class="bbz-list-card" data-action="open-contact" data-id="${c.id}">
+                  ${helpers.avatarHtml(c)}
+                  <div class="bbz-list-card-body">
+                    <div class="bbz-list-card-title">${helpers.escapeHtml(c.fullName || c.nachname)}${c.archiviert ? ' <span class="bbz-muted" style="font-size:10px;">(archiviert)</span>' : ""}</div>
+                    <div class="bbz-list-card-sub">
+                      ${c.firmTitle ? helpers.escapeHtml(c.firmTitle) : ""}
+                      ${c.funktion ? ` · ${helpers.escapeHtml(c.funktion)}` : ""}
+                      ${c.rolle ? ` · ${helpers.escapeHtml(c.rolle)}` : ""}
+                    </div>
+                  </div>
+                  <div class="bbz-list-card-right">
+                    ${c.leadbbz0 ? helpers.leadbbzBadgeHtml(c.leadbbz0) : ""}
+                    ${c.email1 ? `<span style="font-size:10px;color:var(--subtle);max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${helpers.escapeHtml(c.email1)}</span>` : ""}
+                  </div>
+                </div>`).join("")
+              : ui.emptyBlock("Keine Kontakte für die aktuelle Filterung gefunden.")}
             </div>
           </div>
           </section>
@@ -2779,7 +2957,7 @@
               <button class="bbz-button bbz-button-primary" data-action="open-task-form">+ Task</button>
             </div>
             <div class="bbz-section-body">
-              <div class="bbz-filters-3" style="grid-template-columns:2fr 1fr 1fr;">
+              <div class="bbz-filters-3 bbz-planning-filters" style="grid-template-columns:2fr 1fr 1fr;">
                 <input class="bbz-input" data-filter="planning-search" type="text" placeholder="Suche nach Titel, Firma, Kontakt, Status ..." value="${helpers.escapeHtml(filters.search)}" />
                 <select class="bbz-select" data-filter="planning-groupby">
                   <option value="none"    ${filters.groupBy === "none"    ? "selected" : ""}>Keine Gruppierung</option>
@@ -2788,11 +2966,32 @@
                 </select>
                 <label class="bbz-checkbox"><input type="checkbox" data-filter="planning-open" ${filters.onlyOpen ? "checked" : ""} /> Nur offene Tasks</label>
               </div>
-              <div class="bbz-table-wrap">
+              <!-- Desktop: Tabelle -->
+              <div class="bbz-table-wrap bbz-desktop-only">
                 <table class="bbz-table" style="min-width:1060px;">
                   ${tableHead}
                   <tbody>${baseRows.length ? tableBody : `<tr><td colspan="7">${ui.emptyBlock("Keine Tasks fuer die aktuelle Filterung gefunden.")}</td></tr>`}</tbody>
                 </table>
+              </div>
+              <!-- Mobile: Card-List -->
+              <div class="bbz-mobile-only">
+                ${baseRows.length ? `<div class="bbz-card-list">${groups.map(g => `
+                  ${g.label ? `<div style="padding:8px 14px 4px;font-size:11px;font-weight:700;color:var(--subtle);text-transform:uppercase;letter-spacing:0.06em;">${helpers.escapeHtml(g.label)} (${g.rows.length})</div>` : ""}
+                  ${g.rows.map(t => `
+                    <div class="bbz-task-card" data-action="edit-task" data-id="${t.id}">
+                      <div class="bbz-task-card-top">
+                        <span class="bbz-task-card-title">${helpers.escapeHtml(t.title)}</span>
+                        ${helpers.statusChipHtml(t.status, t.deadline)}
+                      </div>
+                      <div class="bbz-task-card-meta">
+                        ${t.firmTitle ? `<span>${helpers.escapeHtml(t.firmTitle)}</span><span>·</span>` : ""}
+                        ${t.contactName ? `<span>${helpers.escapeHtml(t.contactName)}</span>` : ""}
+                        ${t.deadline ? `<span>·</span><span class="${t.isOpen && t.isOverdue ? "bbz-danger" : ""}">${helpers.relativeDate(t.deadline)}</span>` : ""}
+                        ${t.leadbbz ? `<span>·</span>${helpers.leadbbzBadgeHtml(t.leadbbz)}` : ""}
+                      </div>
+                    </div>`).join("")}
+                `).join("")}</div>`
+                : ui.emptyBlock("Keine Tasks für die aktuelle Filterung.")}
               </div>
             </div>
           </section>
@@ -3160,9 +3359,9 @@
                   <div class="bbz-section-title">${filters.radarMode ? "Pflege A/B" : "Aktivitäten"}</div>
                   <div class="bbz-section-subtitle">${filters.radarMode ? `${radarNever.length + radarCold.length + radarOverdue.length} mit Handlungsbedarf · ${radarOk.length} On Track ✓` : filters.groupBy === "firm" ? "Gruppiert nach Firma" : "Chronologische Timeline"}</div>
                 </div>
-                <div style="display:flex;gap:6px;align-items:center;">
-                  <!-- Tab-Bar -->
-                  <div style="display:flex;border:1px solid var(--line);border-radius:9px;overflow:hidden;background:var(--panel-2);">
+                <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;min-width:0;width:100%;">
+                  <!-- Tab-Bar: nur Desktop (Mobile nutzt bbz-history-tab-bar) -->
+                  <div class="bbz-desktop-only" style="display:flex;border:1px solid var(--line);border-radius:9px;overflow:hidden;background:var(--panel-2);">
                     <button class="bbz-button" style="height:32px;font-size:12px;border:none;border-radius:0;padding:0 10px;${!filters.radarMode ? "background:var(--panel);color:var(--text);font-weight:700;" : "background:none;color:var(--muted);"}"
                       data-action="kpi-filter" data-scope="history-radar" ${!filters.radarMode ? "disabled" : ""}>
                       Aktivitäten
@@ -3173,11 +3372,11 @@
                     </button>
                   </div>
                   ${!filters.radarMode ? `
-                  <select class="bbz-select" style="height:32px;font-size:12px;" data-filter="history-groupby">
+                  <select class="bbz-select" style="height:32px;font-size:12px;flex:1;min-width:120px;" data-filter="history-groupby">
                     <option value="date" ${filters.groupBy === "date" ? "selected" : ""}>📅 Nach Datum</option>
                     <option value="firm" ${filters.groupBy === "firm" ? "selected" : ""}>🏢 Nach Firma</option>
                   </select>
-                  <button class="bbz-button bbz-button-primary" style="height:32px;font-size:12px;"
+                  <button class="bbz-button bbz-button-primary" style="height:32px;font-size:12px;flex-shrink:0;white-space:nowrap;"
                     ${activeFirmHasNoContacts
                       ? `disabled title="Zuerst einen Kontakt bei ${helpers.escapeHtml(activeFirm.title)} erfassen"`
                       : `data-action="open-history-form"`}>+ Aktivität</button>` : ""}
@@ -3190,7 +3389,8 @@
                   <input class="bbz-input" style="width:100%;" data-filter="history-search" type="text"
                     placeholder="Suche nach Firma ..." value="${helpers.escapeHtml(filters.search)}" />
                 </div>
-                <div class="bbz-table-wrap">
+                <!-- Desktop: Tabelle -->
+                <div class="bbz-table-wrap bbz-desktop-only">
                   <table class="bbz-table">
                     <thead><tr>
                       <th></th>
@@ -3206,7 +3406,7 @@
                         const signalPriority = { overdue: 0, never: 1, cold: 2 };
                         const search = filters.search.trim().toLowerCase();
                         const allRadarRows = [...radarNever, ...radarOverdue, ...radarCold.filter(f => !radarOverdue.includes(f))]
-                          .filter((f, i, arr) => arr.findIndex(x => x.id === f.id) === i) // deduplicate
+                          .filter((f, i, arr) => arr.findIndex(x => x.id === f.id) === i)
                           .filter(f => !search || helpers.textIncludes(f.title, search))
                           .sort((a, b) => {
                             const pa = signalPriority[helpers.firmSignal(a)] ?? 9;
@@ -3253,6 +3453,52 @@
                       })()}
                     </tbody>
                   </table>
+                </div>
+                <!-- Mobile: Card-List -->
+                <div class="bbz-mobile-only">
+                  ${(() => {
+                    const signalPriority = { overdue: 0, never: 1, cold: 2 };
+                    const search = filters.search.trim().toLowerCase();
+                    const allRadarRows = [...radarNever, ...radarOverdue, ...radarCold.filter(f => !radarOverdue.includes(f))]
+                      .filter((f, i, arr) => arr.findIndex(x => x.id === f.id) === i)
+                      .filter(f => !search || helpers.textIncludes(f.title, search))
+                      .sort((a, b) => {
+                        const pa = signalPriority[helpers.firmSignal(a)] ?? 9;
+                        const pb = signalPriority[helpers.firmSignal(b)] ?? 9;
+                        if (pa !== pb) return pa - pb;
+                        return helpers.compareDateAsc(a.latestActivity, b.latestActivity);
+                      });
+                    if (!allRadarRows.length) return ui.emptyBlock("Keine Pflege-Fälle gefunden.");
+                    return `<div class="bbz-card-list">${allRadarRows.map(firm => {
+                      const sig = helpers.firmSignal(firm);
+                      const signalClass = sig === "overdue" ? "bbz-signal-red" : "bbz-signal-amber";
+                      const lastDate = helpers.toDate(firm.latestActivity);
+                      const months = lastDate ? (today.getFullYear() - lastDate.getFullYear()) * 12 + (today.getMonth() - lastDate.getMonth()) : null;
+                      const grundText = sig === "never" ? "🔴 Nie kontaktiert"
+                        : sig === "cold" ? `🟡 Seit ${months} Monat${months !== 1 ? "en" : ""} still`
+                        : `⚠️ ${firm.tasks.filter(t => t.isOpen && t.isOverdue).length} Task(s) überfällig`;
+                      const hasContacts = firm.contacts.length > 0;
+                      return `
+                        <div class="bbz-list-card" data-action="open-firm" data-id="${firm.id}">
+                          <span class="bbz-signal ${signalClass}"></span>
+                          <div class="bbz-list-card-body">
+                            <div class="bbz-list-card-title">${helpers.escapeHtml(firm.title)}</div>
+                            <div class="bbz-list-card-sub">
+                              ${firm.klassifizierung ? `<span class="${helpers.firmBadgeClass(firm.klassifizierung)}" style="margin-right:4px;">${helpers.escapeHtml(firm.klassifizierung)}</span>` : ""}
+                              ${grundText}
+                              ${firm.latestActivity ? ` · ${helpers.relativeDate(firm.latestActivity)}` : ""}
+                            </div>
+                          </div>
+                          <div class="bbz-list-card-right">
+                            ${sig === "never"
+                              ? `<button class="bbz-button bbz-button-secondary" style="height:26px;font-size:11px;padding:0 8px;" data-action="open-task-form" data-firm-id="${firm.id}">+ Task</button>`
+                              : hasContacts
+                              ? `<button class="bbz-button bbz-button-secondary" style="height:26px;font-size:11px;padding:0 8px;" data-action="open-history-form" data-firm-id="${firm.id}">+ Aktivität</button>`
+                              : ""}
+                          </div>
+                        </div>`;
+                    }).join("")}</div>`;
+                  })()}
                 </div>` : `
                 <!-- Timeline -->
                 <div class="bbz-filters-2" style="display:grid;grid-template-columns:1fr auto;gap:10px;margin-bottom:10px;align-items:center;">
@@ -3360,11 +3606,11 @@
             <div class="bbz-kpi bbz-kpi-blue" style="display:flex;flex-direction:column;justify-content:space-between;">
               <div>
                 <div class="bbz-kpi-label">Event Nachbearbeitung</div>
-                <div class="bbz-kpi-value" style="font-size:22px;margin-top:4px;letter-spacing:-0.03em;">Vergangene<br>Teilnahmen</div>
+                <div style="font-size:15px;font-weight:700;margin-top:4px;letter-spacing:-0.02em;line-height:1.3;">Vergangene Teilnahmen</div>
               </div>
-              <button class="bbz-button bbz-button-primary" style="margin-top:10px;height:34px;font-size:12px;width:100%;"
+              <button class="bbz-button bbz-button-primary" style="margin-top:10px;"
                 data-action="open-batch-event" data-event-name="" data-mode="eventhistory">
-                Vergangene Eventteilnahmen pflegen
+                Teilnahmen pflegen
               </button>
             </div>
 
@@ -3406,8 +3652,9 @@
                       + Kontakte hinzufügen
                     </button>
                   </div>
-                  <div class="bbz-section-body">
-                    <div class="bbz-table-wrap">
+                  <div class="bbz-section-body" style="padding:0;">
+                    <!-- Desktop: Tabelle -->
+                    <div class="bbz-table-wrap bbz-desktop-only" style="border:none;border-radius:0;">
                       <table class="bbz-table">
                         <thead><tr>
                           <th></th><th>Kontakt</th><th>Firma</th><th>Segment</th><th>Funktion / Rolle</th><th>Letzte Aktivität</th><th>Tasks</th><th></th>
@@ -3431,6 +3678,27 @@
                           }).join("")}
                         </tbody>
                       </table>
+                    </div>
+                    <!-- Mobile: Card-List -->
+                    <div class="bbz-mobile-only bbz-card-list">
+                      ${group.contacts.map(item => `
+                        <div class="bbz-list-card">
+                          ${helpers.avatarHtml({ vorname: (item.contactName||"").split(" ")[0]||"", nachname: (item.contactName||"").split(" ").slice(-1)[0]||"" })}
+                          <div class="bbz-list-card-body">
+                            <div class="bbz-list-card-title">
+                              <a class="bbz-link" data-action="open-contact" data-id="${item.contactId}">${helpers.escapeHtml(item.contactName)}</a>
+                            </div>
+                            <div class="bbz-list-card-sub">
+                              ${item.firmTitle ? helpers.escapeHtml(item.firmTitle) : "—"}
+                              ${item.segment ? ` · <span class="${helpers.firmBadgeClass(item.segment)}">${helpers.escapeHtml(item.segment)}</span>` : ""}
+                              ${item.latestHistoryDate ? ` · ${helpers.relativeDate(item.latestHistoryDate)}` : ""}
+                            </div>
+                          </div>
+                          <div class="bbz-list-card-right">
+                            ${item.openTasksCount > 0 ? `<span class="bbz-status-chip bbz-status-open">${item.openTasksCount}</span>` : ""}
+                            <button class="bbz-button bbz-button-secondary" style="height:26px;font-size:11px;padding:0 8px;" data-action="open-history-form" data-contact-id="${item.contactId}">+ Aktivität</button>
+                          </div>
+                        </div>`).join("")}
                     </div>
                   </div>
                 </section>`;
@@ -3477,12 +3745,23 @@
         ui.setLoading(true);
         ui.setMessage("");
         await api.login();
-        // Choices und Daten beim Login parallel laden
+        // Consent-Probe sequenziell VOR Promise.all() —
+        // verhindert parallele 403-Flut + interaction_in_progress bei fehlendem Consent
+        await api.ensureConsent();
         await Promise.all([api.loadAll(), api.loadColumnChoices()]);
         ui.setMessage("Anmeldung erfolgreich. Daten wurden geladen.", "success");
       } catch (error) {
         console.error(error);
-        ui.setMessage(`Anmeldung fehlgeschlagen: ${error.message}`, "error");
+        // Lesbare Fehlermeldungen statt roher JSON-Blobs
+        let msg = error.message || "Unbekannter Fehler.";
+        if (msg.includes("accessDenied") || msg.includes("Access denied")) {
+          msg = "Zugriff verweigert (403). Fehlende Berechtigung für SharePoint. Bitte erneut anmelden — ein Consent-Dialog sollte erscheinen.";
+        } else if (msg.includes("interaction_in_progress")) {
+          msg = "Ein anderer Login-Vorgang läuft noch. Bitte Seite neu laden.";
+        } else if (msg.includes("Graph 403")) {
+          msg = "Kein Zugriff auf SharePoint. Bitte den Administrator kontaktieren (App-Berechtigung prüfen).";
+        }
+        ui.setMessage(`Anmeldung fehlgeschlagen: ${msg}`, "error");
       } finally {
         ui.setLoading(false);
         this.render();
@@ -3496,6 +3775,8 @@
         ui.setLoading(true);
         ui.setMessage("");
         await api.acquireToken();
+        // Consent-Probe auch bei Refresh — Browser-Profil könnte gewechselt haben
+        await api.ensureConsent();
         // Refresh: Choices ebenfalls neu laden — SP-Schema könnte sich geändert haben
         await Promise.all([api.loadAll(), api.loadColumnChoices()]);
         ui.setMessage("Daten erfolgreich neu geladen.", "success");
