@@ -1,0 +1,26 @@
+{
+  "name": "bbz CRM",
+  "short_name": "bbz CRM",
+  "description": "bbz Beratung – CRM für Firmen, Kontakte und Events",
+  "start_url": "/crm-spa-dev/",
+  "scope": "/crm-spa-dev/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#0a1628",
+  "theme_color": "#0a1628",
+  "lang": "de",
+  "icons": [
+    {
+      "src": "icons/android-chrome-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icons/android-chrome-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
