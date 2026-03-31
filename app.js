@@ -8,7 +8,7 @@
       tenantId: "3643e7ab-d166-4e27-bd5f-c5bbfcd282d7",
       clientId: "c4143c1e-33ea-4c4d-a410-58110f966d0a",
       authority: "https://login.microsoftonline.com/3643e7ab-d166-4e27-bd5f-c5bbfcd282d7",
-      redirectUri: "https://markusbaechler.github.io/crm-spa-dev/",
+      redirectUri: "https://markusbaechler.github.io/crm-spa/",
       // FIX 3a: Scope auf ReadWrite erweitert — verhindert zweiten Login-Prompt beim Write-Layer
       scopes: ["User.Read", "Sites.ReadWrite.All"]
     },
@@ -195,6 +195,14 @@
 
     toDate(value) {
       if (!value) return null;
+      // FIX: SP liefert ISO-Strings wie "2026-03-31T00:00:00Z" (UTC).
+      // new Date("2026-03-31T00:00:00Z") ergibt in CH (UTC+1) → 30.03. 23:00 Uhr,
+      // was alle Datumsvergleiche und relativen Anzeigen um einen Tag verschiebt.
+      // Lösung: Datumsteil (YYYY-MM-DD) als lokales Datum interpretieren.
+      if (typeof value === "string") {
+        const m = value.match(/^(\d{4})-(\d{2})-(\d{2})/);
+        if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+      }
       const d = new Date(value);
       return Number.isNaN(d.getTime()) ? null : d;
     },
