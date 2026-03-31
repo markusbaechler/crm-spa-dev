@@ -8,7 +8,7 @@
       tenantId: "3643e7ab-d166-4e27-bd5f-c5bbfcd282d7",
       clientId: "c4143c1e-33ea-4c4d-a410-58110f966d0a",
       authority: "https://login.microsoftonline.com/3643e7ab-d166-4e27-bd5f-c5bbfcd282d7",
-      redirectUri: "https://markusbaechler.github.io/crm-spa/",
+      redirectUri: "https://markusbaechler.github.io/crm-spa-dev/",
       // FIX 3a: Scope auf ReadWrite erweitert — verhindert zweiten Login-Prompt beim Write-Layer
       scopes: ["User.Read", "Sites.ReadWrite.All"]
     },
